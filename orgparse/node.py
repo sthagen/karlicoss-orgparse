@@ -1,12 +1,8 @@
 import re
 import itertools
 from typing import List, Iterable, Iterator, Optional, Union, Tuple, cast, Dict, Set, Sequence, Any
-try:
-    from collections.abc import Sequence
-except ImportError:
-    from collections import Sequence
 
-from .date import OrgDate, OrgDateClock, OrgDateRepeatedTask, parse_sdc
+from .date import OrgDate, OrgDateClock, OrgDateRepeatedTask, parse_sdc, OrgDateScheduled, OrgDateDeadline, OrgDateClosed
 from .inline import to_plain_text
 from .extra import to_rich_text, Rich
 from .utils.py3compat import PY3, unicode
@@ -495,6 +491,9 @@ class OrgBaseNode(Sequence):
         # content
         self._lines: List[str] = []
 
+        self._properties: Dict[str, PropertyValue] = {}
+        self._timestamps: List[OrgDate] = []
+
         # FIXME: use `index` argument to set index.  (Currently it is
         # done externally in `parse_lines`.)
         if index is not None:
@@ -752,6 +751,37 @@ class OrgBaseNode(Sequence):
                 return root
             root = parent
 
+    @property
+    def properties(self) -> Dict[str, PropertyValue]:
+        """
+        Node properties as a dictionary.
+
+        >>> from orgparse import loads
+        >>> root = loads('''
+        ... * Node
+        ...   :PROPERTIES:
+        ...   :SomeProperty: value
+        ...   :END:
+        ... ''')
+        >>> root.children[0].properties['SomeProperty']
+        'value'
+
+        """
+        return self._properties
+
+    def get_property(self, key, val=None) -> Optional[PropertyValue]:
+        """
+        Return property named ``key`` if exists or ``val`` otherwise.
+
+        :arg str key:
+            Key of property.
+
+        :arg val:
+            Default value to return.
+
+        """
+        return self._properties.get(key, val)
+
     # parser
 
     @classmethod
@@ -774,6 +804,24 @@ class OrgBaseNode(Sequence):
         for todokey in ['TODO', 'SEQ_TODO', 'TYP_TODO']:
             for val in special_comments.get(todokey, []):
                 self.env.add_todo_keys(*parse_seq_todo(val))
+
+    def _iparse_properties(self, ilines: Iterator[str]) -> Iterator[str]:
+        self._properties = {}
+        in_property_field = False
+        for line in ilines:
+            if in_property_field:
+                if line.find(":END:") >= 0:
+                    break
+                else:
+                    (key, val) = parse_property(line)
+                    if key is not None and val is not None:
+                        self._properties.update({key: val})
+            elif line.find(":PROPERTIES:") >= 0:
+                in_property_field = True
+            else:
+                yield line
+        for line in ilines:
+            yield line
 
     # misc
 
@@ -881,397 +929,6 @@ class OrgBaseNode(Sequence):
         """
         return False
 
-    def __unicode__(self):
-        return unicode("\n").join(self._lines)
-
-    if PY3:
-        __str__ = __unicode__
-    else:
-        def __str__(self):
-            return unicode(self).encode('utf-8')
-
-    # todo hmm, not sure if it really belongs here and not to OrgRootNode?
-    def get_file_property_list(self, property):
-        """
-        Return a list of the selected property
-        """
-        vals = self._special_comments.get(property.upper(), None)
-        return [] if vals is None else vals
-
-    def get_file_property(self, property):
-        """
-        Return a single element of the selected property or None if it doesn't exist
-        """
-        vals = self._special_comments.get(property.upper(), None)
-        if vals is None:
-            return None
-        elif len(vals) == 1:
-            return vals[0]
-        else:
-            raise RuntimeError('Multiple values for property {}: {}'.format(property, vals))
-
-
-class OrgRootNode(OrgBaseNode):
-
-    """
-    Node to represent a file
-
-    See :class:`OrgBaseNode` for other available functions.
-
-    """
-
-    @property
-    def _body_lines(self) -> List[str]: # type: ignore[override]
-        # todo hacky..
-        # for root node, the body is whatever is before the first node
-        return self._lines
-
-    @property
-    def heading(self) -> str:
-        return ''
-
-    def _get_tags(self, inher=False) -> Set[str]:
-        filetags = self.get_file_property_list('FILETAGS')
-        return set(filetags)
-
-    @property
-    def level(self):
-        return 0
-
-    def get_parent(self, max_level=None):
-        return None
-
-    def is_root(self):
-        return True
-
-
-class OrgNode(OrgBaseNode):
-
-    """
-    Node to represent normal org node
-
-    See :class:`OrgBaseNode` for other available functions.
-
-    """
-
-    def __init__(self, *args, **kwds) -> None:
-        super(OrgNode, self).__init__(*args, **kwds)
-        # fixme instead of casts, should organize code in such a way that they aren't necessary
-        self._heading = cast(str, None)
-        self._level = None
-        self._tags = cast(List[str], None)
-        self._todo: Optional[str] = None
-        self._priority = None
-        self._properties: Dict[str, PropertyValue] = {}
-        self._scheduled = OrgDate(None)
-        self._deadline = OrgDate(None)
-        self._closed = OrgDate(None)
-        self._timestamps: List[OrgDate] = []
-        self._clocklist: List[OrgDateClock] = []
-        self._body_lines: List[str] = []
-        self._repeated_tasks: List[OrgDateRepeatedTask] = []
-
-    # parser
-
-    def _parse_pre(self):
-        """Call parsers which must be called before tree structuring"""
-        self._parse_heading()
-        # FIXME: make the following parsers "lazy"
-        ilines: Iterator[str] = iter(self._lines)
-        try:
-            next(ilines)            # skip heading
-        except StopIteration:
-            return
-        ilines = self._iparse_sdc(ilines)
-        ilines = self._iparse_clock(ilines)
-        ilines = self._iparse_properties(ilines)
-        ilines = self._iparse_repeated_tasks(ilines)
-        ilines = self._iparse_timestamps(ilines)
-        self._body_lines = list(ilines)
-
-    def _parse_heading(self) -> None:
-        heading = self._lines[0]
-        (heading, self._level) = parse_heading_level(heading)
-        (heading, self._tags) = parse_heading_tags(heading)
-        (heading, self._todo) = parse_heading_todos(
-            heading, self.env.all_todo_keys)
-        (heading, self._priority) = parse_heading_priority(heading)
-        self._heading = heading
-
-    # The following ``_iparse_*`` methods are simple generator based
-    # parser.  See ``_parse_pre`` for how it is used.  The principle
-    # is simple: these methods get an iterator and returns an iterator.
-    # If the item returned by the input iterator must be dedicated to
-    # the parser, do not yield the item or yield it as-is otherwise.
-
-    def _iparse_sdc(self, ilines: Iterator[str]) -> Iterator[str]:
-        """
-        Parse SCHEDULED, DEADLINE and CLOSED time tamps.
-
-        They are assumed be in the first line.
-
-        """
-        try:
-            line = next(ilines)
-        except StopIteration:
-            return
-        (self._scheduled, self._deadline, self._closed) = parse_sdc(line)
-
-        if not (self._scheduled or
-                self._deadline or
-                self._closed):
-            yield line  # when none of them were found
-
-        for line in ilines:
-            yield line
-
-    def _iparse_clock(self, ilines: Iterator[str]) -> Iterator[str]:
-        self._clocklist = []
-        for line in ilines:
-            cl = OrgDateClock.from_str(line)
-            if cl:
-                self._clocklist.append(cl)
-            else:
-                yield line
-
-    def _iparse_timestamps(self, ilines: Iterator[str]) -> Iterator[str]:
-        self._timestamps = []
-        self._timestamps.extend(OrgDate.list_from_str(self._heading))
-        for l in ilines:
-            self._timestamps.extend(OrgDate.list_from_str(l))
-            yield l
-
-    def _iparse_properties(self, ilines: Iterator[str]) -> Iterator[str]:
-        self._properties = {}
-        in_property_field = False
-        for line in ilines:
-            if in_property_field:
-                if line.find(":END:") >= 0:
-                    break
-                else:
-                    (key, val) = parse_property(line)
-                    if key is not None and val is not None:
-                        self._properties.update({key: val})
-            elif line.find(":PROPERTIES:") >= 0:
-                in_property_field = True
-            else:
-                yield line
-        for line in ilines:
-            yield line
-
-    def _iparse_repeated_tasks(self, ilines: Iterator[str]) -> Iterator[str]:
-        self._repeated_tasks = []
-        for line in ilines:
-            match = self._repeated_tasks_re.search(line)
-            if match:
-                # FIXME: move this parsing to OrgDateRepeatedTask.from_str
-                mdict = match.groupdict()
-                done_state = mdict['done']
-                todo_state = mdict['todo']
-                date = OrgDate.from_str(mdict['date'])
-                self._repeated_tasks.append(
-                    OrgDateRepeatedTask(date.start, todo_state, done_state))
-            else:
-                yield line
-
-    _repeated_tasks_re = re.compile(
-        r'''
-        \s+ - \s+
-        State \s+ "(?P<done> [^"]+)" \s+
-        from  \s+ "(?P<todo> [^"]+)" \s+
-        \[ (?P<date> [^\]]+) \]''',
-        re.VERBOSE)
-
-    def get_heading(self, format='plain'):
-        """
-        Return a string of head text without tags and TODO keywords.
-
-        >>> from orgparse import loads
-        >>> node = loads('* TODO Node 1').children[0]
-        >>> node.get_heading()
-        'Node 1'
-
-        It strips off inline markup by default (``format='plain'``).
-        You can get the original raw string by specifying
-        ``format='raw'``.
-
-        >>> node = loads('* [[link][Node 1]]').children[0]
-        >>> node.get_heading()
-        'Node 1'
-        >>> node.get_heading(format='raw')
-        '[[link][Node 1]]'
-
-        """
-        return self._get_text(self._heading, format)
-
-    @property
-    def heading(self) -> str:
-        """Alias of ``.get_heading(format='plain')``."""
-        return self.get_heading()
-
-    @property
-    def level(self):
-        return self._level
-        """
-        Level attribute of this node.  Top level node is level 1.
-
-        >>> from orgparse import loads
-        >>> root = loads('''
-        ... * Node 1
-        ... ** Node 2
-        ... ''')
-        >>> (n1, n2) = root.children
-        >>> root.level
-        0
-        >>> n1.level
-        1
-        >>> n2.level
-        2
-
-        """
-
-    @property
-    def priority(self):
-        """
-        Priority attribute of this node.  It is None if undefined.
-
-        >>> from orgparse import loads
-        >>> (n1, n2) = loads('''
-        ... * [#A] Node 1
-        ... * Node 2
-        ... ''').children
-        >>> n1.priority
-        'A'
-        >>> n2.priority is None
-        True
-
-        """
-        return self._priority
-
-    def _get_tags(self, inher=False) -> Set[str]:
-        tags = set(self._tags)
-        if inher:
-            parent = self.get_parent()
-            if parent:
-                return tags | parent._get_tags(inher=True)
-        return tags
-
-    @property
-    def todo(self) -> Optional[str]:
-        """
-        A TODO keyword of this node if exists or None otherwise.
-
-        >>> from orgparse import loads
-        >>> root = loads('* TODO Node 1')
-        >>> root.children[0].todo
-        'TODO'
-
-        """
-        return self._todo
-
-    def get_property(self, key, val=None) -> Optional[PropertyValue]:
-        """
-        Return property named ``key`` if exists or ``val`` otherwise.
-
-        :arg str key:
-            Key of property.
-
-        :arg val:
-            Default value to return.
-
-        """
-        return self._properties.get(key, val)
-
-    @property
-    def properties(self) -> Dict[str, PropertyValue]:
-        """
-        Node properties as a dictionary.
-
-        >>> from orgparse import loads
-        >>> root = loads('''
-        ... * Node
-        ...   :PROPERTIES:
-        ...   :SomeProperty: value
-        ...   :END:
-        ... ''')
-        >>> root.children[0].properties['SomeProperty']
-        'value'
-
-        """
-        return self._properties
-
-    @property
-    def scheduled(self):
-        """
-        Return scheduled timestamp
-
-        :rtype: a subclass of :class:`orgparse.date.OrgDate`
-
-        >>> from orgparse import loads
-        >>> root = loads('''
-        ... * Node
-        ...   SCHEDULED: <2012-02-26 Sun>
-        ... ''')
-        >>> root.children[0].scheduled
-        OrgDateScheduled((2012, 2, 26))
-
-        """
-        return self._scheduled
-
-    @property
-    def deadline(self):
-        """
-        Return deadline timestamp.
-
-        :rtype: a subclass of :class:`orgparse.date.OrgDate`
-
-        >>> from orgparse import loads
-        >>> root = loads('''
-        ... * Node
-        ...   DEADLINE: <2012-02-26 Sun>
-        ... ''')
-        >>> root.children[0].deadline
-        OrgDateDeadline((2012, 2, 26))
-
-        """
-        return self._deadline
-
-    @property
-    def closed(self):
-        """
-        Return timestamp of closed time.
-
-        :rtype: a subclass of :class:`orgparse.date.OrgDate`
-
-        >>> from orgparse import loads
-        >>> root = loads('''
-        ... * Node
-        ...   CLOSED: [2012-02-26 Sun 21:15]
-        ... ''')
-        >>> root.children[0].closed
-        OrgDateClosed((2012, 2, 26, 21, 15, 0))
-
-        """
-        return self._closed
-
-    @property
-    def clock(self):
-        """
-        Return a list of clocked timestamps
-
-        :rtype: a list of a subclass of :class:`orgparse.date.OrgDate`
-
-        >>> from orgparse import loads
-        >>> root = loads('''
-        ... * Node
-        ...   CLOCK: [2012-02-26 Sun 21:10]--[2012-02-26 Sun 21:15] =>  0:05
-        ... ''')
-        >>> root.children[0].clock
-        [OrgDateClock((2012, 2, 26, 21, 10, 0), (2012, 2, 26, 21, 15, 0))]
-
-        """
-        return self._clocklist
-
     def get_timestamps(self, active=False, inactive=False,
                        range=False, point=False):
         """
@@ -1378,6 +1035,355 @@ class OrgNode(OrgBaseNode):
         """
         return self.get_timestamps(active=True, inactive=True, range=True)
 
+    def __unicode__(self):
+        return unicode("\n").join(self._lines)
+
+    if PY3:
+        __str__ = __unicode__
+    else:
+        def __str__(self):
+            return unicode(self).encode('utf-8')
+
+    # todo hmm, not sure if it really belongs here and not to OrgRootNode?
+    def get_file_property_list(self, property):
+        """
+        Return a list of the selected property
+        """
+        vals = self._special_comments.get(property.upper(), None)
+        return [] if vals is None else vals
+
+    def get_file_property(self, property):
+        """
+        Return a single element of the selected property or None if it doesn't exist
+        """
+        vals = self._special_comments.get(property.upper(), None)
+        if vals is None:
+            return None
+        elif len(vals) == 1:
+            return vals[0]
+        else:
+            raise RuntimeError('Multiple values for property {}: {}'.format(property, vals))
+
+
+class OrgRootNode(OrgBaseNode):
+
+    """
+    Node to represent a file. Its body contains all lines before the first
+    headline
+
+    See :class:`OrgBaseNode` for other available functions.
+    """
+
+    @property
+    def heading(self) -> str:
+        return ''
+
+    def _get_tags(self, inher=False) -> Set[str]:
+        filetags = self.get_file_property_list('FILETAGS')
+        return set(filetags)
+
+    @property
+    def level(self):
+        return 0
+
+    def get_parent(self, max_level=None):
+        return None
+
+    def is_root(self):
+        return True
+
+    # parsers
+
+    def _parse_pre(self):
+        """Call parsers which must be called before tree structuring"""
+        ilines: Iterator[str] = iter(self._lines)
+        ilines = self._iparse_properties(ilines)
+        ilines = self._iparse_timestamps(ilines)
+        self._body_lines = list(ilines)
+
+    def _iparse_timestamps(self, ilines: Iterator[str]) -> Iterator[str]:
+        self._timestamps = []
+        for line in ilines:
+            self._timestamps.extend(OrgDate.list_from_str(line))
+            yield line
+
+
+class OrgNode(OrgBaseNode):
+
+    """
+    Node to represent normal org node
+
+    See :class:`OrgBaseNode` for other available functions.
+
+    """
+
+    def __init__(self, *args, **kwds) -> None:
+        super(OrgNode, self).__init__(*args, **kwds)
+        # fixme instead of casts, should organize code in such a way that they aren't necessary
+        self._heading = cast(str, None)
+        self._level = None
+        self._tags = cast(List[str], None)
+        self._todo: Optional[str] = None
+        self._priority = None
+        self._scheduled = OrgDateScheduled(None)
+        self._deadline = OrgDateDeadline(None)
+        self._closed = OrgDateClosed(None)
+        self._clocklist: List[OrgDateClock] = []
+        self._body_lines: List[str] = []
+        self._repeated_tasks: List[OrgDateRepeatedTask] = []
+
+    # parser
+
+    def _parse_pre(self):
+        """Call parsers which must be called before tree structuring"""
+        self._parse_heading()
+        # FIXME: make the following parsers "lazy"
+        ilines: Iterator[str] = iter(self._lines)
+        try:
+            next(ilines)            # skip heading
+        except StopIteration:
+            return
+        ilines = self._iparse_sdc(ilines)
+        ilines = self._iparse_clock(ilines)
+        ilines = self._iparse_properties(ilines)
+        ilines = self._iparse_repeated_tasks(ilines)
+        ilines = self._iparse_timestamps(ilines)
+        self._body_lines = list(ilines)
+
+    def _parse_heading(self) -> None:
+        heading = self._lines[0]
+        (heading, self._level) = parse_heading_level(heading)
+        (heading, self._tags) = parse_heading_tags(heading)
+        (heading, self._todo) = parse_heading_todos(
+            heading, self.env.all_todo_keys)
+        (heading, self._priority) = parse_heading_priority(heading)
+        self._heading = heading
+
+    # The following ``_iparse_*`` methods are simple generator based
+    # parser.  See ``_parse_pre`` for how it is used.  The principle
+    # is simple: these methods get an iterator and returns an iterator.
+    # If the item returned by the input iterator must be dedicated to
+    # the parser, do not yield the item or yield it as-is otherwise.
+
+    def _iparse_sdc(self, ilines: Iterator[str]) -> Iterator[str]:
+        """
+        Parse SCHEDULED, DEADLINE and CLOSED time tamps.
+
+        They are assumed be in the first line.
+
+        """
+        try:
+            line = next(ilines)
+        except StopIteration:
+            return
+        (self._scheduled, self._deadline, self._closed) = parse_sdc(line)
+
+        if not (self._scheduled or
+                self._deadline or
+                self._closed):
+            yield line  # when none of them were found
+
+        for line in ilines:
+            yield line
+
+    def _iparse_clock(self, ilines: Iterator[str]) -> Iterator[str]:
+        self._clocklist = []
+        for line in ilines:
+            cl = OrgDateClock.from_str(line)
+            if cl:
+                self._clocklist.append(cl)
+            else:
+                yield line
+
+    def _iparse_timestamps(self, ilines: Iterator[str]) -> Iterator[str]:
+        self._timestamps = []
+        self._timestamps.extend(OrgDate.list_from_str(self._heading))
+        for l in ilines:
+            self._timestamps.extend(OrgDate.list_from_str(l))
+            yield l
+
+    def _iparse_repeated_tasks(self, ilines: Iterator[str]) -> Iterator[str]:
+        self._repeated_tasks = []
+        for line in ilines:
+            match = self._repeated_tasks_re.search(line)
+            if match:
+                # FIXME: move this parsing to OrgDateRepeatedTask.from_str
+                mdict = match.groupdict()
+                done_state = mdict['done']
+                todo_state = mdict['todo']
+                date = OrgDate.from_str(mdict['date'])
+                self._repeated_tasks.append(
+                    OrgDateRepeatedTask(date.start, todo_state, done_state))
+            else:
+                yield line
+
+    _repeated_tasks_re = re.compile(
+        r'''
+        \s*- \s+
+        State \s+ "(?P<done> [^"]+)" \s+
+        from  \s+ "(?P<todo> [^"]+)" \s+
+        \[ (?P<date> [^\]]+) \]''',
+        re.VERBOSE)
+
+    def get_heading(self, format='plain'):
+        """
+        Return a string of head text without tags and TODO keywords.
+
+        >>> from orgparse import loads
+        >>> node = loads('* TODO Node 1').children[0]
+        >>> node.get_heading()
+        'Node 1'
+
+        It strips off inline markup by default (``format='plain'``).
+        You can get the original raw string by specifying
+        ``format='raw'``.
+
+        >>> node = loads('* [[link][Node 1]]').children[0]
+        >>> node.get_heading()
+        'Node 1'
+        >>> node.get_heading(format='raw')
+        '[[link][Node 1]]'
+
+        """
+        return self._get_text(self._heading, format)
+
+    @property
+    def heading(self) -> str:
+        """Alias of ``.get_heading(format='plain')``."""
+        return self.get_heading()
+
+    @property
+    def level(self):
+        return self._level
+        """
+        Level attribute of this node.  Top level node is level 1.
+
+        >>> from orgparse import loads
+        >>> root = loads('''
+        ... * Node 1
+        ... ** Node 2
+        ... ''')
+        >>> (n1, n2) = root.children
+        >>> root.level
+        0
+        >>> n1.level
+        1
+        >>> n2.level
+        2
+
+        """
+
+    @property
+    def priority(self):
+        """
+        Priority attribute of this node.  It is None if undefined.
+
+        >>> from orgparse import loads
+        >>> (n1, n2) = loads('''
+        ... * [#A] Node 1
+        ... * Node 2
+        ... ''').children
+        >>> n1.priority
+        'A'
+        >>> n2.priority is None
+        True
+
+        """
+        return self._priority
+
+    def _get_tags(self, inher=False) -> Set[str]:
+        tags = set(self._tags)
+        if inher:
+            parent = self.get_parent()
+            if parent:
+                return tags | parent._get_tags(inher=True)
+        return tags
+
+    @property
+    def todo(self) -> Optional[str]:
+        """
+        A TODO keyword of this node if exists or None otherwise.
+
+        >>> from orgparse import loads
+        >>> root = loads('* TODO Node 1')
+        >>> root.children[0].todo
+        'TODO'
+
+        """
+        return self._todo
+
+    @property
+    def scheduled(self):
+        """
+        Return scheduled timestamp
+
+        :rtype: a subclass of :class:`orgparse.date.OrgDate`
+
+        >>> from orgparse import loads
+        >>> root = loads('''
+        ... * Node
+        ...   SCHEDULED: <2012-02-26 Sun>
+        ... ''')
+        >>> root.children[0].scheduled
+        OrgDateScheduled((2012, 2, 26))
+
+        """
+        return self._scheduled
+
+    @property
+    def deadline(self):
+        """
+        Return deadline timestamp.
+
+        :rtype: a subclass of :class:`orgparse.date.OrgDate`
+
+        >>> from orgparse import loads
+        >>> root = loads('''
+        ... * Node
+        ...   DEADLINE: <2012-02-26 Sun>
+        ... ''')
+        >>> root.children[0].deadline
+        OrgDateDeadline((2012, 2, 26))
+
+        """
+        return self._deadline
+
+    @property
+    def closed(self):
+        """
+        Return timestamp of closed time.
+
+        :rtype: a subclass of :class:`orgparse.date.OrgDate`
+
+        >>> from orgparse import loads
+        >>> root = loads('''
+        ... * Node
+        ...   CLOSED: [2012-02-26 Sun 21:15]
+        ... ''')
+        >>> root.children[0].closed
+        OrgDateClosed((2012, 2, 26, 21, 15, 0))
+
+        """
+        return self._closed
+
+    @property
+    def clock(self):
+        """
+        Return a list of clocked timestamps
+
+        :rtype: a list of a subclass of :class:`orgparse.date.OrgDate`
+
+        >>> from orgparse import loads
+        >>> root = loads('''
+        ... * Node
+        ...   CLOCK: [2012-02-26 Sun 21:10]--[2012-02-26 Sun 21:15] =>  0:05
+        ... ''')
+        >>> root.children[0].clock
+        [OrgDateClock((2012, 2, 26, 21, 10, 0), (2012, 2, 26, 21, 15, 0))]
+
+        """
+        return self._clocklist
+
     def has_date(self):
         """
         Return ``True`` if it has any kind of timestamp
@@ -1451,6 +1457,8 @@ def parse_lines(lines: Iterable[str], filename, env=None) -> OrgNode:
         nodelist.append(node)
     # parse headings (level, TODO, TAGs, and heading)
     nodelist[0]._index = 0
+    # parse the root node
+    nodelist[0]._parse_pre()
     for (i, node) in enumerate(nodelist[1:], 1):   # nodes except root node
         node._index = i
         node._parse_pre()

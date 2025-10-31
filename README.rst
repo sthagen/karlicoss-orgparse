@@ -6,11 +6,22 @@
 * `Documentation (Read the Docs) <https://orgparse.readthedocs.org>`_
 * `Repository (at GitHub) <https://github.com/karlicoss/orgparse>`_
 * `PyPI <https://pypi.python.org/pypi/orgparse>`_
+* `conda-forge <https://anaconda.org/conda-forge/orgparse>`_
 
 Install
 -------
 
+You can install ``orgpase`` via PyPI
+
+.. code-block:: console
+
   pip install orgparse
+
+or via conda-forge
+
+.. code-block:: console
+
+  conda install orgparse -c conda-forge
 
 
 Usage
@@ -96,3 +107,13 @@ True
 'some text'
 >>> node.body
 '  Body texts...'
+
+
+Project status
+--------------
+
+Project is maintained by @karlicoss (myself).
+
+For my personal use, orgparse mostly has all features I need, so there hasn't been much active development lately.
+
+However, contributions are always welcome! Please provide tests along with your contribution if you're fixing bugs or adding new functionality.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Iterable, Iterator, Sequence
+from pathlib import Path
 from typing import Any, cast
 
 from .date import (
@@ -348,7 +349,7 @@ class OrgEnv:
         self,
         todos: Sequence[str] | None = None,
         dones: Sequence[str] | None = None,
-        filename: str = '<undefined>',
+        filename: str | Path = '<undefined>',
     ) -> None:
         if dones is None:
             dones = ['DONE']
@@ -357,7 +358,7 @@ class OrgEnv:
         self._todos = list(todos)
         self._dones = list(dones)
         self._todo_not_specified_in_comment = True
-        self._filename = filename
+        self._filename = str(filename)
         self._nodes: list[OrgBaseNode] = []
 
     @property
@@ -429,10 +430,10 @@ class OrgEnv:
     @property
     def filename(self) -> str:
         """
-        Return a path to the source file or similar information.
+        Return the source filename as a string.
 
-        If the org objects are not loaded from a file, this value
-        will be a string of the form ``<SOME_TEXT>``.
+        A :class:`pathlib.Path` passed to ``OrgEnv`` is converted to a string.
+        Documents loaded without a filename use a placeholder such as ``<string>``.
         """
         return self._filename
 
@@ -449,6 +450,7 @@ class OrgBaseNode(Sequence):
     Base class for :class:`OrgRootNode` and :class:`OrgNode`
 
     .. attribute:: env
+       :no-index:
 
        An instance of :class:`OrgEnv`.
        All nodes in a same file shares same instance.
@@ -532,6 +534,30 @@ class OrgBaseNode(Sequence):
             tree-like traversing.
 
             """
+
+    @property
+    def end_linenumber(self) -> int:
+        """One-based, inclusive end line of this node's own source text.
+
+        Includes the heading, metadata, and trailing blank lines, excluding descendants.
+        For :class:`OrgRootNode`, this covers the preamble before the first heading and returns 0 when it is empty.
+        Use ``node[-1].end_linenumber`` for the end of the entire subtree.
+
+        >>> from orgparse import loads
+        >>> root = loads('''Preamble
+        ... * Parent
+        ... body
+        ... ** Child
+        ... child body
+        ... * Last''')
+        >>> [(node.linenumber, node.end_linenumber) for node in root]
+        [(1, 1), (2, 3), (4, 5), (6, 6)]
+        >>> root[1][-1].end_linenumber
+        5
+        >>> loads('* Heading').end_linenumber
+        0
+        """
+        return self.linenumber + len(self._lines) - 1
 
     def __iter__(self):
         yield self
@@ -1444,7 +1470,7 @@ class OrgNode(OrgBaseNode):
         return self._repeated_tasks
 
 
-def parse_lines(lines: Iterable[str], filename, env=None) -> OrgNode:
+def parse_lines(lines: Iterable[str], filename, env=None) -> OrgRootNode:
     if not env:
         env = OrgEnv(filename=filename)
     elif env.filename != filename:
